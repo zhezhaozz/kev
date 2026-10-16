@@ -4,6 +4,9 @@ __pycache__/
 .pytest_cache/
 *.pyc
 
+# data
+data/
+
 # model runs: weights are large; keep eval results and training logs (for the plot)
 runs/*
 !runs/kev/

@@ -11,6 +11,10 @@ import math
 import random
 from dataclasses import asdict
 from pathlib import Path
+import os
+
+os.environ.setdefault("HF_HOME", "/nfs/turbo/umms-vgvinodv/users/zzhaozhe/cache")
+os.environ.setdefault("XET_LOG_DIR", "/nfs/turbo/umms-vgvinodv/users/zzhaozhe/cache/xet/logs")
 
 import torch
 
