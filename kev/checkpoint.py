@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
+from torch.torch_version import TorchVersion
 
 from .model import DecisionModel, is_hybrid, load_tokenizer, pad_id
 
@@ -74,7 +75,10 @@ class Meta:
 
 
 def read_meta(run):
-    return Meta.from_dict(torch.load(f"{run}/head.pt", map_location="cpu"))
+    # Older WebQSP metadata stores torch.__version__ as a TorchVersion.
+    with torch.serialization.safe_globals([TorchVersion]):
+        data = torch.load(f"{run}/head.pt", map_location="cpu", weights_only=True)
+    return Meta.from_dict(data)
 
 
 def write_meta(run, meta):
