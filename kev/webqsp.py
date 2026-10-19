@@ -70,6 +70,9 @@ def evaluate(policy, dataset, hops, beam_width, out, candidate_edges=128, seed=4
 
 def train(policy, dataset, development, args, out, provenance):
     optimizer = torch.optim.AdamW(policy.model.trainable_parameters(), lr=args.lr, weight_decay=0.0)
+    use_value = args.baseline == "value"
+    value_optimizer = (torch.optim.AdamW(policy.value_head.parameters(), lr=args.value_lr, weight_decay=0.0)
+                       if use_value else None)
     rng = random.Random(args.seed)
     sampler = CandidateSampler(args.candidate_edges, args.seed)
     baseline, updates, best_f1, best_checkpoint = 0.0, 0, -1.0, None
@@ -80,15 +83,16 @@ def train(policy, dataset, development, args, out, provenance):
             for example in examples:
                 graph = dataset.graph(example)
                 before = sampler.counts()
-                trajectories = [rollout(policy, example.query, graph, dataset.names, args.hops, sampler)
+                trajectories = [rollout(policy, example.query, graph, dataset.names, args.hops, sampler, with_value=use_value)
                                 for _ in range(args.rollouts)]
-                stats = reinforce(policy, trajectories, example.answers, optimizer, baseline, args.entropy)
+                stats = reinforce(policy, trajectories, example.answers, optimizer, baseline, args.entropy, value_optimizer)
                 updates += int(stats["optimizer_step"])
-                row = {"epoch": epoch, "id": example.query.id, "update": updates, "baseline": baseline, **stats,
+                row = {"epoch": epoch, "id": example.query.id, "update": updates,
+                       "baseline": stats["baseline_mean"] if use_value else baseline, "reward_ema": baseline, **stats,
                        "sampling": sampler.counts(before),
                        "failures": [t.failure for t in trajectories if t.failure]}
-                # Baseline uses only PREVIOUS questions at the point a gradient is
-                # computed. Including this group's rewards would bias the estimate.
+                # The EMA uses only PREVIOUS questions for gradients. In value
+                # mode it is logged as a reference, not used as the actor baseline.
                 baseline = args.baseline_decay * baseline + (1 - args.baseline_decay) * stats["reward"]
                 log.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
                 log.flush()
@@ -100,7 +104,8 @@ def train(policy, dataset, development, args, out, provenance):
                 raise RuntimeError("no policy updates: inspect train.jsonl for missing graphs or context overflow")
             checkpoint = out / f"epoch-{epoch}" / "checkpoint"
             policy.save(checkpoint, {**provenance, "epoch": epoch, "updates": updates,
-                                     "baseline": baseline, "objective": "terminal-membership REINFORCE"})
+                                     "reward_ema": baseline, "baseline_mode": args.baseline,
+                                     "objective": "terminal-membership REINFORCE"})
             policy.model.eval()
             report = evaluate(policy, development, args.hops, args.beam_width, out / f"epoch-{epoch}" / "dev",
                               args.candidate_edges, args.seed)
@@ -144,6 +149,9 @@ def parse_args():
             command.add_argument("--rollouts", type=int, default=4, help="sampled trajectories per question/update")
             command.add_argument("--lr", type=float, default=5e-6)
             command.add_argument("--entropy", type=float, default=0.01)
+            command.add_argument("--baseline", choices=("ema", "value"), default="value",
+                                 help="value: direct V(s,C) from detached <decide> features; ema: version-1 moving average")
+            command.add_argument("--value-lr", type=float, default=1e-4, help="separate value-head learning rate; used only with --baseline value")
             command.add_argument("--baseline-decay", type=float, default=0.9)
             command.add_argument("--max-updates", type=int, default=0, help="0: all epochs; otherwise save/dev-evaluate at this limit")
     args = parser.parse_args()
@@ -160,6 +168,8 @@ def parse_args():
             parser.error("epochs/rollouts must be positive and max-updates nonnegative")
         if not 0 < args.lr <= 2e-5 or not 0 <= args.baseline_decay < 1 or not math.isfinite(args.entropy) or args.entropy < 0:
             parser.error("require 0 < lr <= 2e-5, 0 <= baseline-decay < 1, finite entropy >= 0")
+        if not math.isfinite(args.value_lr) or args.value_lr <= 0:
+            parser.error("value-lr must be finite and positive")
     if Path(args.out).exists():
         parser.error("refusing to overwrite an existing output directory")
     return args
@@ -172,7 +182,8 @@ def main():
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = select(args.device, dtype=torch.bfloat16 if args.precision == "bf16" else torch.float32)
-    policy = Policy(args.checkpoint, device, args.precision, args.row_tokens, args.temperature, training=args.command == "train")
+    policy = Policy(args.checkpoint, device, args.precision, args.row_tokens, args.temperature,
+                    training=args.command == "train", use_value_head=args.command == "train" and args.baseline == "value")
     code = [Path(__file__).with_name(name) for name in
             ("webqsp.py", "webqsp_data.py", "webqsp_policy.py", "model.py", "checkpoint.py", "api.py", "predictors.py")]
     provenance = {"args": vars(args), "dataset": dataset.provenance,

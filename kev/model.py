@@ -323,8 +323,13 @@ class DecisionModel(nn.Module):
         mask = branch_mask_batch([e["seg"] for e in encs], self.device, dtype=lm_dtype, opts=[e["opt"] for e in encs] if isolate else None, length=ids.shape[1])
         return self.lm(input_ids=ids, position_ids=pos, attention_mask=mask).last_hidden_state.float()   # head stays fp32
 
-    def _readout(self, h, enc):
-        return [self.head(h[d], h[torch.tensor(oi, device=self.device)]) for d, oi in zip(enc["decide_idx"], enc["opt_idx"])]
+    def _decision_readout(self, h_decide, h_opts, return_features=False):
+        logits = self.head(h_decide, h_opts)
+        return (logits, h_decide) if return_features else logits
+
+    def _readout(self, h, enc, return_features=False):
+        return [self._decision_readout(h[d], h[torch.tensor(oi, device=self.device)], return_features)
+                for d, oi in zip(enc["decide_idx"], enc["opt_idx"])]
 
     def rows_form(self, encs):
         """Whether these records run as causal rows: hybrid backbones always (the recurrent layers cannot honour the packed
@@ -361,7 +366,7 @@ class DecisionModel(nn.Module):
             out += [h[i, : len(row_ids)] for i, (row_ids, _) in enumerate(part)]
         return out
 
-    def forward_rows_batch(self, encs, shared_prefix=False):
+    def forward_rows_batch(self, encs, shared_prefix=False, return_features=False):
         """Row form: every question of every record is one causal row = state tokens + its branch tokens. Returns the same
         nested logits as forward_batch. Exact isolation by construction (rows are independent); the state is recomputed
         per row (Q x state tokens), which training accepts; serving and probs() use the prefix cache instead. shared_prefix
@@ -370,7 +375,8 @@ class DecisionModel(nn.Module):
         if shared_prefix:
             from .shared_prefix import branch_hidden   # here, not at the top: the HF Space vendors model.py alone
             splits = [rows_of(e) for e in encs]
-            return [[self.head(h[r["decide"]], h[torch.tensor(r["opts"], device=self.device)]) for h, r in zip(hs, rows)]
+            return [[self._decision_readout(h[r["decide"]], h[torch.tensor(r["opts"], device=self.device)], return_features)
+                     for h, r in zip(hs, rows)]
                     for hs, (_, _, rows) in zip(branch_hidden(self.lm, splits, self.pad_id, self.device), splits)]
         rows, readouts = [], []   # one causal row per question; readouts[i] = (record, <decide> offset, option offsets)
         for b, e in enumerate(encs):
@@ -379,19 +385,20 @@ class DecisionModel(nn.Module):
                 rows.append((S + r["ids"], Sp + r["pos"])); readouts.append((b, len(S) + r["decide"], [len(S) + o for o in r["opts"]]))
         out = [[] for _ in encs]
         for h, (b, d, oi) in zip(self._rows_hidden(rows), readouts):
-            out[b].append(self.head(h[d], h[torch.tensor(oi, device=self.device)]))
+            out[b].append(self._decision_readout(h[d], h[torch.tensor(oi, device=self.device)], return_features))
         return out
 
-    def forward(self, enc):
-        """Returns list of logits tensors, one per question."""
-        return self.forward_batch([enc])[0]
+    def forward(self, enc, return_features=False):
+        """Logits per question; optionally (logits, <decide> hidden vector) from the same pass."""
+        return self.forward_batch([enc], return_features=return_features)[0]
 
-    def forward_batch(self, encs, shared_prefix=False):
+    def forward_batch(self, encs, shared_prefix=False, return_features=False):
         """List (per record) of lists (per question) of logits. Row form or packed block-causal mask, see rows_form
-        (the packed mask already runs each state once; shared_prefix does that for the row form of a hybrid backbone)."""
-        if self.rows_form(encs): return self.forward_rows_batch(encs, shared_prefix and self.hybrid)
+        (the packed mask already runs each state once; shared_prefix does that for the row form of a hybrid backbone).
+        With return_features, each question returns (logits, <decide> hidden vector) from that same pass."""
+        if self.rows_form(encs): return self.forward_rows_batch(encs, shared_prefix and self.hybrid, return_features)
         hs = self.hidden_batch(encs)
-        return [self._readout(hs[b], e) for b, e in enumerate(encs)]
+        return [self._readout(hs[b], e, return_features) for b, e in enumerate(encs)]
 
     @torch.no_grad()
     def probs(self, enc):

@@ -6,10 +6,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from kev.model import ContextOverflow
+from kev.checkpoint import Meta, read_meta
+from kev.model import ContextOverflow, DecisionModel, PointerHead
 from kev.suite import write_json, write_jsonl
 from kev.webqsp_data import Action, Dataset, Example, Graph, NO_OP, Query, observation, score
-from kev.webqsp_policy import CandidateSampler, Decision, Trajectory, beam_search, reinforce, rollout
+from kev.webqsp_policy import CandidateSampler, Decision, Policy, Trajectory, ValueHead, beam_search, reinforce, rollout
 
 
 def make_graph(inverse=True):
@@ -232,3 +233,176 @@ def test_reinforce_accumulates_before_one_step_and_uses_terminal_reward():
     assert parameter.item() == pytest.approx(0.05)  # -(1/2) * 2 * (1 - p), with p=1/2.
     assert stats["reward"] == 0.5
     assert stats["entropy_per_decision"] == pytest.approx(math.log(2))
+
+
+@pytest.mark.parametrize("mode", ["packed", "rows", "shared_prefix"])
+def test_decide_features_share_the_logit_pass_and_preserve_default_scoring(monkeypatch, mode):
+    model = DecisionModel.__new__(DecisionModel)
+    torch.nn.Module.__init__(model)
+    model.device, model.pad_id, model.hybrid = "cpu", 0, mode != "packed"
+    model.head = PointerHead(2, dp=2)
+    encs = [{"ids": list(range(offset, offset + 8)), "seg": [0, 0, 1, 1, 1, 2, 2, 2],
+             "pos": [0, 1, 2, 3, 4, 2, 3, 4], "decide_idx": [4, 7], "opt_idx": [[2, 3], [5, 6]]}
+            for offset in (0, 10)]
+    calls = []
+
+    def hidden(ids):
+        ids = torch.tensor(ids, dtype=torch.float32)
+        return torch.stack([ids, ids + 1], dim=-1)
+
+    def packed(batch):
+        calls.append("packed")
+        return torch.stack([hidden(e["ids"]) for e in batch])
+
+    def rows(batch):
+        calls.append("rows")
+        return [hidden(ids) for ids, _ in batch]
+
+    def shared(lm, splits, pad_id, device):
+        calls.append("shared_prefix")
+        return [[hidden(r["ids"]) for r in branches] for _, _, branches in splits]
+
+    monkeypatch.setattr(model, "hidden_batch", packed)
+    monkeypatch.setattr(model, "_rows_hidden", rows)
+    if mode == "shared_prefix":
+        model.lm = torch.nn.Identity()
+        monkeypatch.setattr("kev.shared_prefix.branch_hidden", shared)
+    plain = model.forward_batch(encs, shared_prefix=mode == "shared_prefix")
+    paired = model.forward_batch(encs, shared_prefix=mode == "shared_prefix", return_features=True)
+    assert calls == [mode, mode]  # One backbone call per invocation, not a second pass for features.
+    for e, logits, pairs in zip(encs, plain, paired):
+        expected = hidden(e["ids"])
+        for index, (z, features) in enumerate(pairs):
+            assert torch.equal(z, logits[index])
+            assert torch.equal(features, expected[e["decide_idx"][index]])
+
+
+def test_value_head_preserves_rng_and_detaches_actor_features():
+    rng = torch.get_rng_state().clone()
+    head = ValueHead(3)
+    assert torch.equal(torch.get_rng_state(), rng)
+    features = torch.ones(2, 3, requires_grad=True)
+    assert torch.equal(head(features), torch.full((2,), 0.5))
+    head(features).sum().backward()
+    assert features.grad is None
+    assert head.projection.weight.grad.abs().sum() > 0
+
+
+def test_policy_value_prediction_uses_one_pass_one_temperature_and_copies_only_features():
+    source = torch.arange(12, dtype=torch.float32).reshape(6, 2).requires_grad_()
+    calls = []
+
+    class TinyModel(torch.nn.Module):
+        def forward(self, encoded, return_features=False):
+            calls.append(return_features)
+            logits = torch.tensor([0.0, 2.0])
+            return [(logits, source[3])] if return_features else [logits]
+
+    policy = Policy.__new__(Policy)
+    policy.model, policy.value_head = TinyModel(), ValueHead(2)
+    policy.precision, policy.temperature = "fp32", 2.0
+    distribution, baseline, features = policy.distribution_and_value({})
+    assert calls == [True] and baseline == 0.5
+    assert torch.allclose(distribution.probs, torch.tensor([0.0, 1.0]).softmax(-1))
+    assert not features.requires_grad and features.device.type == "cpu"
+    assert features.untyped_storage().nbytes() == features.numel() * features.element_size()
+    with torch.no_grad():
+        source.add_(100)
+    assert torch.equal(features, torch.tensor([6.0, 7.0]))
+
+
+def test_rollout_records_pre_action_values_and_beam_does_not_request_them():
+    class RecordingPolicy(FixedPolicy):
+        value_calls = 0
+
+        def distribution_and_value(self, encoded):
+            self.value_calls += 1
+            return self.distribution(encoded), 0.25, torch.tensor([1.0, 2.0])
+
+    policy = RecordingPolicy()
+    query = Query("q", "Question", "m.topic", "Topic")
+    trajectory = rollout(policy, query, make_graph(inverse=False), {}, hops=1, with_value=True)
+    step, = trajectory.decisions
+    assert step.baseline == 0.25 and torch.equal(step.value_features, torch.tensor([1.0, 2.0]))
+    beam_search(policy, query, make_graph(inverse=False), {}, hops=1, width=1)
+    assert policy.value_calls == 1
+
+
+def test_value_update_uses_saved_baselines_and_does_not_backpropagate_into_actor():
+    parameter = torch.nn.Parameter(torch.tensor(0.0))
+    features = [torch.tensor([1.0, 0.0], requires_grad=True), torch.tensor([0.0, 1.0], requires_grad=True)]
+    head, events = ValueHead(2), []
+
+    class TinyPolicy:
+        model = SimpleNamespace(trainable_parameters=lambda: [parameter])
+        value_head = head
+
+        def distribution(self, encoded):
+            assert parameter.item() == 0.0  # Entire actor group precedes both optimizer steps.
+            assert head.projection.weight.count_nonzero() == 0
+            return torch.distributions.Categorical(logits=torch.stack([parameter * 0, parameter]))
+
+    class RecordingSGD(torch.optim.SGD):
+        def step(self, closure=None):
+            events.append("actor" if self.param_groups[0]["params"][0] is parameter else "critic")
+            return super().step(closure)
+
+    actor = RecordingSGD([parameter], lr=0.1)
+    critic = RecordingSGD(head.parameters(), lr=1.0)
+    # Deliberately differ from the head's CURRENT 0.5 prediction to detect a
+    # mistaken recomputation of the baseline when applying the actor gradient.
+    trajectories = [Trajectory("answer", decisions=(Decision({}, 1, 0.25, features[0]),) * 2),
+                    Trajectory("wrong", decisions=(Decision({}, 0, 0.75, features[1]),) * 2)]
+    stats = reinforce(TinyPolicy(), trajectories, {"answer"}, actor, baseline=0.0,
+                      entropy_weight=0.0, value_optimizer=critic)
+    assert events == ["actor", "critic"]
+    assert parameter.item() == pytest.approx(0.075)
+    assert parameter.grad.item() == pytest.approx(-0.75)
+    assert all(f.grad is None for f in features)
+    assert torch.allclose(head.projection.weight, torch.tensor([[0.125, -0.125]]))
+    assert stats["value_loss"] == pytest.approx(0.25)
+    assert stats["value_mse_before_update"] == pytest.approx(0.75 ** 2)
+    assert stats["baseline_mode"] == "value" and stats["value_optimizer_step"]
+
+
+def test_value_checkpoint_round_trip_and_ema_save_drops_stale_critic(tmp_path, monkeypatch):
+    from kev import webqsp_policy
+
+    class LocalCheckpoint:
+        def __init__(self, directory):
+            self.meta = read_meta(directory)
+
+    monkeypatch.setattr(webqsp_policy, "Checkpoint", LocalCheckpoint)
+    policy = Policy.__new__(Policy)
+    policy.temperature, policy.value_head = 2.0, ValueHead(2)
+    with torch.no_grad():
+        policy.value_head.projection.weight.copy_(torch.tensor([[0.2, -0.3]]))
+        policy.value_head.projection.bias.fill_(0.1)
+    policy.checkpoint = SimpleNamespace(meta=Meta(base="Qwen/Qwen3.5-4B", holdout=["old-calibration"]))
+    policy.model = SimpleNamespace(head=torch.nn.Linear(2, 2), lm=SimpleNamespace(save_pretrained=lambda path: None))
+    policy.tok = SimpleNamespace(save_pretrained=lambda path: None)
+    directory = tmp_path / "value"
+    policy.save(directory, {"baseline_mode": "value"})
+    metadata = read_meta(directory)
+    restored = ValueHead(2)
+    restored.load_checkpoint_state(metadata.extra["webqsp_value_head"])
+    features = torch.tensor([[1.0, 2.0], [3.0, -1.0]])
+    assert torch.equal(restored(features), policy.value_head(features))
+    assert metadata.temperature == 2.0 and metadata.holdout == []
+    with pytest.raises(ValueError, match="incompatible"):
+        ValueHead(3).load_checkpoint_state(metadata.extra["webqsp_value_head"])
+    policy.value_head = None
+    policy.save(tmp_path / "ema", {"baseline_mode": "ema"})
+    assert "webqsp_value_head" not in read_meta(tmp_path / "ema").extra
+
+
+def test_value_mode_handles_no_decisions_and_rejects_missing_rollout_values():
+    parameter = torch.nn.Parameter(torch.tensor(0.0))
+    head = ValueHead(2)
+    policy = SimpleNamespace(model=SimpleNamespace(trainable_parameters=lambda: [parameter]), value_head=head)
+    actor, critic = torch.optim.SGD([parameter], lr=0.1), torch.optim.SGD(head.parameters(), lr=0.1)
+    stats = reinforce(policy, [Trajectory(None, failure="missing_graph")], {"answer"}, actor, 0.0, 0.0, critic)
+    assert not stats["optimizer_step"] and not stats["value_optimizer_step"]
+    assert stats["value_loss"] is None and stats["baseline_mean"] is None
+    with pytest.raises(ValueError, match="saved during rollout"):
+        reinforce(policy, [Trajectory("answer", decisions=(Decision({}, 1),))], {"answer"}, actor, 0.0, 0.0, critic)

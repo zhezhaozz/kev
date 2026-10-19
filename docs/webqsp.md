@@ -6,7 +6,7 @@ This is a MINERVA-style terminal-reward traversal experiment, not a reproduction
 
 The implementation has been source-reviewed but **has not been executed, benchmarked, or trained**. The commands below are for you to run. A100 memory use, runtime, and QA accuracy have not been measured.
 
-This branch implements **version 1: sampled candidate sets with the existing moving-average reward baseline**. The default offers at most 128 graph edges plus `NO_OP`, within the configured token budget. `--candidate-edges 0` restores the original all-actions, strict-overflow protocol. Compare frozen and trained checkpoints with the same candidate settings.
+This branch implements **version 2: sampled candidate sets with a direct value head V(s, C)**, built on version 1's identical sampler. Training defaults to `--baseline value`; `--baseline ema` selects version 1's moving-average reward baseline. The default offers at most 128 graph edges plus `NO_OP`, within the configured token budget. `--candidate-edges 0` restores the original all-actions, strict-overflow protocol. Compare frozen and trained checkpoints with the same candidate settings.
 
 ## Data
 
@@ -99,17 +99,18 @@ Every evaluation writes `report.json`, `rows.jsonl` with path traces and failure
   --checkpoint jaredpalmer/kev-4b@v1.0 \
   --questions "$WEBQSP_DATA/WebQSP/data/WebQSP.train.json" \
   "${WEBQSP_ARGS[@]}" \
-  --epochs 3 --rollouts 4 --lr 5e-6 --entropy 0.01 --baseline-decay 0.9 \
-  --out runs/webqsp-rl
+  --epochs 3 --rollouts 4 --lr 5e-6 --entropy 0.01 \
+  --baseline value --value-lr 1e-4 \
+  --out runs/webqsp-rl-v2
 ```
 
 This trains only on NSM's train IDs within Microsoft's training file. After each epoch it saves `epoch-N/checkpoint`, evaluates on the disjoint NSM dev IDs, and writes the highest-dev-F1 checkpoint to `best.json` (earlier epoch wins a tie). It never evaluates test during training. Use development results to choose hyperparameters and the checkpoint before reading trained test results.
 
 The loss averages over the sampled trajectories:
 
-$$L = -\frac{1}{K}\sum_{k=1}^{K}\left[(R_k-b)\sum_t \log\pi(a_{k,t}\mid s_{k,t},q,C_{k,t}) + \beta\sum_t H(\pi(\cdot\mid s_{k,t},q,C_{k,t}))\right].$$
+$$L_\pi = -\frac{1}{K}\sum_{k=1}^{K}\sum_t\left[(R_k-b_{k,t})\log\pi(a_{k,t}\mid s_{k,t},q,C_{k,t}) + \beta H(\pi(\cdot\mid s_{k,t},q,C_{k,t}))\right].$$
 
-`R` is 1 only if the final endpoint is in the union of the question's annotated answer sets, otherwise 0. There are no intermediate rewards or gold path labels. `b` is an exponential moving reward baseline from previous questions, updated after the current group's gradient is computed. The trainer samples with no gradient, recomputes each selected action with gradients, accumulates all steps/rollouts, clips the gradient norm to 1, then updates once. It does not reuse trajectories after an optimizer update.
+`R` is 1 only if the final endpoint is in the union of the question's annotated answer sets, otherwise 0. There are no intermediate rewards or gold path labels, and no discounting: every decision in a rollout has the same terminal-return target. With `--baseline value`, `b` is the value prediction saved for that decision during rollout. With `--baseline ema`, it is the exponential moving reward baseline from previous questions, updated after the current group's gradient is computed. The trainer samples with no gradient, recomputes each selected action with gradients, accumulates all steps/rollouts, clips the gradient norm to 1, then updates once. It does not reuse trajectories after an optimizer update.
 
 `C` is the offered candidate list at that hop. Each rollout keeps the exact encoding and selected index for gradient recomputation; it never draws another subset while computing that decision's loss. The objective is expected terminal reward under this sampler. The loss averages over rollouts, with no additional division by candidate count and no importance correction toward the full-action policy.
 
@@ -118,14 +119,38 @@ LoRA dropout and attention dropout are disabled in both passes. Temperature is a
 Select the saved checkpoint and evaluate with the same arguments as the frozen baseline:
 
 ```bash
-WEBQSP_BEST=$(.venv/bin/python -c 'import json; print(json.load(open("runs/webqsp-rl/best.json", encoding="utf-8"))["checkpoint"])')
+WEBQSP_BEST=$(.venv/bin/python -c 'import json; print(json.load(open("runs/webqsp-rl-v2/best.json", encoding="utf-8"))["checkpoint"])')
 .venv/bin/python -m kev.webqsp evaluate \
   --checkpoint "$WEBQSP_BEST" \
   --questions "$WEBQSP_DATA/WebQSP/data/WebQSP.test.json" --split test \
-  "${WEBQSP_ARGS[@]}" --out runs/webqsp-rl-test
+  "${WEBQSP_ARGS[@]}" --out runs/webqsp-rl-v2-test
 ```
 
-Output directories must be new. `--max-updates N` ends training at that number of optimizer updates and then saves/evaluates development. Checkpoints contain inference weights and provenance; exact optimizer/RNG resume is not implemented. A later `--checkpoint` continuation is a new run with a new optimizer and baseline.
+Output directories must be new. `--max-updates N` ends training at that number of actor optimizer updates and then saves/evaluates development. Checkpoints contain actor weights, value-head weights when enabled, and provenance; exact optimizer/RNG resume is not implemented. A later `--checkpoint` continuation restores the actor and, in value mode, an available saved critic, but starts new optimizers/RNG streams and resets the reward EMA. Evaluation uses only the actor.
+
+## Direct value baseline
+
+For the sampled, ordered candidate list `C`, the same Kev forward pass supplies action logits and the hidden vector at `<decide>`. That token can attend to the question, traversal state, history and all offered options. The critic estimates success under the current policy and future candidate sampling:
+
+$$V_\phi(s,C)=\operatorname{sigmoid}(w^\top\operatorname{stopgrad}(h_{\text{decide}})+b).$$
+
+The head is a single fp32 linear projection with a sigmoid, giving values between 0 and 1 for the binary terminal reward. Zero initialization produces 0.5 before any fitting; this is an initialization, not an estimated success rate. Creating the head preserves the actor's random-number stream. The actor's LoRA and pointer head retain their existing optimizer and learning rate. The critic has its own AdamW optimizer, no weight decay, gradient clipping at 1, and `--value-lr 1e-4` as a starting value to assess on development data.
+
+For each question's rollout group:
+
+1. Sample candidate sets and actions without gradients. Before each action is sampled, save its scalar value prediction and a detached CPU copy of the `<decide>` vector, along with the exact action encoding/index.
+2. Compute terminal rewards, then update the actor using the saved advantage `R - V(s,C)`. The baseline is a constant in this loss; it is not recomputed after fitting the current reward.
+3. Fit only the small value head to the saved vectors and terminal returns, after the actor update. The critic loss is the mean squared error across the group's recorded decisions, `mean((V - R)^2)`. No extra backbone forward pass is needed, and critic gradients cannot change the backbone, LoRA adapter or pointer head.
+
+The actor loss averages over trajectories and sums their decisions; the critic loss averages over recorded decisions. These normalizations serve separate optimizers. Forced `NO_OP` moves have no action choice and generate no actor/critic training sample. A failed rollout still trains its earlier recorded decisions with terminal reward 0. A group with no recorded decisions updates neither optimizer.
+
+This implements the direct value baseline only: there is no Q head, TD bootstrapping, GAE, action-dependent baseline or `B(s,C)` correction. The baseline can reduce gradient variance; it does not add reward signals when successful paths are rare.
+
+In `train.jsonl`, `baseline_mode` identifies the method; `baseline_mean` and `advantage_mean` average the values actually used over decisions. `value_mse_before_update` compares the saved rollout predictions with returns; `value_loss` is the critic's pre-step training MSE on those same vectors (normally the same up to numerical batching differences). `value_optimizer_step` records whether the critic updated. `reward_ema` remains an earlier-reward reference in value mode and is not used in its actor loss. Fields without a sample are `null`.
+
+The critic is saved in the `webqsp_value_head` metadata inside `head.pt`, using the normal checkpoint helpers. Inference remains compatible with the actor-only loader. A value-mode continuation restores this head when present; an original or version-1 checkpoint starts a fresh head. Training with `--baseline ema` omits the critic from subsequent checkpoints, so a stale critic is not carried along with a newly changed actor.
+
+For the version-1 comparison on this branch, use the same command and released starting checkpoint, replace `--baseline value --value-lr 1e-4` with `--baseline ema --baseline-decay 0.9`, and choose a new output directory such as `runs/webqsp-rl-v1`. Start both versions from the same initial actor checkpoint rather than training version 2 on version 1's result. Keep the candidate cap, token budget, seed, rollout count, actor learning rate, horizon and evaluation settings matched.
 
 ## Candidate sampling
 
@@ -156,7 +181,7 @@ Training and beam evaluation call the same candidate constructor. Each training 
 
 ## Optional verification
 
-The focused checks cover split isolation, missing-graph denominators, label separation, mediator/inverse/NO_OP traversal, best-parse metrics, seeded candidate sampling, strict token budgeting, training/evaluation candidate consistency, overflow handling, and a small analytical policy-gradient update. They require no model weights:
+The focused checks cover split isolation, missing-graph denominators, label separation, mediator/inverse/NO_OP traversal, best-parse metrics, seeded candidate sampling, strict token budgeting, training/evaluation candidate consistency, overflow handling, analytical actor updates, value-gradient isolation, saved baselines, feature readout in packed/causal/shared-prefix forms, and value-head checkpoint round trips. They require no model weights:
 
 ```bash
 .venv/bin/python -m pytest tests/test_webqsp.py tests/test_conventions.py -q
