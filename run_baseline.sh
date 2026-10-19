@@ -7,6 +7,6 @@ WEBQSP_ARGS=(
 )
 
 .venv/bin/python -m kev.webqsp evaluate \
-  --checkpoint jaredpalmer/kev-4b@v1.0 \
+  --checkpoint "$WEBQSP_DATA/runs/webqsp-rl/epoch-2/checkpoint" \
   --questions "$WEBQSP_DATA/WebQSP/data/WebQSP.test.json" --split test \
-  "${WEBQSP_ARGS[@]}" --out "$WEBQSP_DATA/runs/webqsp-frozen-test"
+  "${WEBQSP_ARGS[@]}" --out "$WEBQSP_DATA/runs/webqsp-rl/epoch-2/test"
