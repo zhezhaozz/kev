@@ -9,7 +9,7 @@ import torch
 from kev.model import ContextOverflow
 from kev.suite import write_json, write_jsonl
 from kev.webqsp_data import Action, Dataset, Example, Graph, NO_OP, Query, observation, score
-from kev.webqsp_policy import Decision, Trajectory, beam_search, reinforce, rollout
+from kev.webqsp_policy import CandidateSampler, Decision, Trajectory, beam_search, reinforce, rollout
 
 
 def make_graph(inverse=True):
@@ -105,6 +105,84 @@ class FixedPolicy:
         # Always move on a forward edge when possible; NO_OP remains legal.
         logits = [0.0 if "NO_OP" in option else 10.0 for option in record["questions"][0]["options"]]
         return torch.distributions.Categorical(logits=torch.tensor(logits))
+
+
+def test_candidate_sampling_keeps_noop_and_reuses_a_seeded_stream():
+    actions = (Action(NO_OP, "start"), *(Action(f"r{i}", f"e{i}") for i in range(30)))
+    encode = lambda selected: {"ids": list(range(len(selected))), "selected": selected}
+    first, replay = CandidateSampler(4, 17), CandidateSampler(4, 17)
+    draws = [first.select(actions, encode)[0] for _ in range(3)]
+    assert draws == [replay.select(actions, encode)[0] for _ in range(3)]
+    assert draws[0] != draws[1]
+    assert all(len(draw) == 5 and draw[0] == actions[0] and len(set(draw)) == 5 for draw in draws)
+    assert first.counts()["legal_actions"] == 3 * len(actions)
+    assert first.counts()["offered_actions"] == 15
+    assert first.counts()["capped_decisions"] == 3
+
+
+def test_candidate_budget_keeps_whole_options_and_strict_mode_propagates_overflow():
+    actions = (Action(NO_OP, "start"), *(Action(f"r{i}", f"e{i}") for i in range(12)))
+
+    def encode(selected):
+        tokens = 7 + 3 * len(selected)
+        if tokens > 19:
+            raise ContextOverflow("branch too long")
+        return {"ids": list(range(tokens)), "selected": selected}
+
+    sampler = CandidateSampler(8, 42)
+    selected, encoded = sampler.select(actions, encode)
+    assert len(selected) == 4 and selected[0] == actions[0]
+    assert encoded["selected"] == selected and len(encoded["ids"]) == 19
+    assert sampler.counts()["token_limited_decisions"] == 1
+    with pytest.raises(ContextOverflow):
+        CandidateSampler(0).select(actions, encode)
+
+
+def test_candidate_sampler_does_not_truncate_an_overlong_state_or_instruction():
+    actions = (Action(NO_OP, "start"), Action("edge", "end"))
+    for error in (ContextOverflow("state", state_tokens=20, max_state=10), ContextOverflow("instruction")):
+        def encode(selected):
+            raise error
+        with pytest.raises(ContextOverflow) as raised:
+            CandidateSampler(4).select(actions, encode)
+        assert raised.value is error
+
+
+def test_noop_only_after_budgeting_is_forced_and_small_lists_keep_their_order():
+    actions = (Action(NO_OP, "start"), Action("first", "a"), Action("second", "b"))
+
+    def only_noop_fits(selected):
+        if len(selected) > 1:
+            raise ContextOverflow("branch too long")
+        return {"ids": [1, 2, 3]}
+
+    sampler = CandidateSampler(4)
+    assert sampler.select(actions, only_noop_fits) == ((actions[0],), None)
+    assert sampler.counts()["noop_only_decisions"] == 1
+    assert sampler.counts()["encoded_tokens"] == 3
+    selected, encoded = sampler.select(actions, lambda xs: {"ids": [0] * len(xs)})
+    assert selected == actions and len(encoded["ids"]) == len(actions)
+
+
+def test_rollout_and_beam_share_candidate_construction_and_store_the_offered_input():
+    class RecordingPolicy(FixedPolicy):
+        def __init__(self):
+            self.records = []
+
+        def encode(self, record):
+            self.records.append(record)
+            return {**record, "ids": list(range(len(record["questions"][0]["options"])))}
+
+    graph = Graph({"entities": list(range(10)), "tuples": [[0, 0, i] for i in range(1, 10)]},
+                  [f"e{i}" for i in range(10)], ["move"], inverse=False)
+    query = Query("q", "Question", "e0", "Topic")
+    train_policy, eval_policy = RecordingPolicy(), RecordingPolicy()
+    trajectory = rollout(train_policy, query, graph, {}, 1, CandidateSampler(3, 12))
+    beam_search(eval_policy, query, graph, {}, 1, 2, CandidateSampler(3, 12))
+    assert train_policy.records == eval_policy.records
+    assert len(train_policy.records[0]["questions"][0]["options"]) == 4
+    assert trajectory.decisions[0].encoded["questions"] == train_policy.records[0]["questions"]
+    assert 0 <= trajectory.decisions[0].action_index < 4
 
 
 def test_greedy_consumes_raw_edges_and_noop_uses_remaining_hop():

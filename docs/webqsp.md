@@ -6,6 +6,8 @@ This is a MINERVA-style terminal-reward traversal experiment, not a reproduction
 
 The implementation has been source-reviewed but **has not been executed, benchmarked, or trained**. The commands below are for you to run. A100 memory use, runtime, and QA accuracy have not been measured.
 
+This branch implements **version 1: sampled candidate sets with the existing moving-average reward baseline**. The default offers at most 128 graph edges plus `NO_OP`, within the configured token budget. `--candidate-edges 0` restores the original all-actions, strict-overflow protocol. Compare frozen and trained checkpoints with the same candidate settings.
+
 ## Data
 
 Use these three sources together:
@@ -64,7 +66,7 @@ WEBQSP_ARGS=(
   --nsm-dir "$WEBQSP_DATA/nsm/webqsp"
   --names "$WEBQSP_DATA/entities_names.json"
   --device cuda --precision bf16
-  --hops 3 --beam-width 8 --row-tokens 8192 --seed 42
+  --hops 3 --beam-width 8 --row-tokens 8192 --candidate-edges 128 --seed 42
 )
 ```
 
@@ -105,9 +107,11 @@ This trains only on NSM's train IDs within Microsoft's training file. After each
 
 The loss averages over the sampled trajectories:
 
-$$L = -\frac{1}{K}\sum_{k=1}^{K}\left[(R_k-b)\sum_t \log\pi(a_{k,t}\mid s_{k,t},q) + \beta\sum_t H(\pi(\cdot\mid s_{k,t},q))\right].$$
+$$L = -\frac{1}{K}\sum_{k=1}^{K}\left[(R_k-b)\sum_t \log\pi(a_{k,t}\mid s_{k,t},q,C_{k,t}) + \beta\sum_t H(\pi(\cdot\mid s_{k,t},q,C_{k,t}))\right].$$
 
 `R` is 1 only if the final endpoint is in the union of the question's annotated answer sets, otherwise 0. There are no intermediate rewards or gold path labels. `b` is an exponential moving reward baseline from previous questions, updated after the current group's gradient is computed. The trainer samples with no gradient, recomputes each selected action with gradients, accumulates all steps/rollouts, clips the gradient norm to 1, then updates once. It does not reuse trajectories after an optimizer update.
+
+`C` is the offered candidate list at that hop. Each rollout keeps the exact encoding and selected index for gradient recomputation; it never draws another subset while computing that decision's loss. The objective is expected terminal reward under this sampler. The loss averages over rollouts, with no additional division by candidate count and no importance correction toward the full-action policy.
 
 LoRA dropout and attention dropout are disabled in both passes. Temperature is applied once in sampling, gradient computation, and evaluation; it defaults to the checkpoint's stored value and is kept fixed. After RL that value is a policy hyperparameter, **not a newly validated confidence calibration**. The saved metadata states this and clears the parent's calibration evidence.
 
@@ -123,21 +127,36 @@ WEBQSP_BEST=$(.venv/bin/python -c 'import json; print(json.load(open("runs/webqs
 
 Output directories must be new. `--max-updates N` ends training at that number of optimizer updates and then saves/evaluates development. Checkpoints contain inference weights and provenance; exact optimizer/RNG resume is not implemented. A later `--checkpoint` continuation is a new run with a new optimizer and baseline.
 
+## Candidate sampling
+
+`--candidate-edges N` caps edge moves, excluding the always-retained `NO_OP`:
+
+1. Above the cap, draw N edges uniformly without replacement, keeping their random draw order. Otherwise retain the full legal list in its original order.
+2. Encode the complete state, instruction and offered options with the strict Kev encoder.
+3. If the row is too long, use a random edge order (shuffle the full list if it was not already sampled) and keep the longest prefix that fits, with `NO_OP` first. A binary search checks actual encodings; no option or state text is cut.
+4. If only `NO_OP` fits, execute it as a forced move with no policy gradient. If even the minimal prompt does not fit, retain the existing overflow failure behavior.
+
+The token-budget step produces variable-size subsets. It samples prefixes, not uniformly from every possible budget-feasible subset, and does not search for a better packing after a long early option. `--candidate-edges 0` disables both the cap and budget-based candidate removal: every legal action must fit, as in the original runner. Sampling never reads answer annotations, and the underlying graph remains complete for reachability diagnostics.
+
+Training and beam evaluation call the same candidate constructor. Each training run has a continuing candidate RNG seeded by `--seed`, separate from question shuffling and PyTorch's action sampling. Every evaluation starts a fresh candidate RNG from that seed, so development evaluation does not consume training randomness. Repeated evaluation is reproducible for a fixed policy and environment; different policies can visit different paths and consume the stream differently. Use the same cap, row budget and seed when comparing checkpoints.
+
+`train.jsonl` and evaluation `rows.jsonl` contain per-question `sampling` counts. `report.json` also contains their totals and the `candidate_sampling` configuration. Counts cover successfully prepared decisions: `legal_actions` and `offered_actions` include `NO_OP`, `capped_decisions` counts degree-cap sampling, `token_limited_decisions` counts further budget reductions, `noop_only_decisions` counts forced moves, and `encoded_tokens` sums the lengths actually admitted. A naturally forced `NO_OP` needs no encoding and contributes zero tokens. Failed prompt construction is recorded separately in the existing overflow/failure fields. Reachable-answer coverage still refers to the full graph, before candidate sampling.
+
 ## Protocol and interpretation
 
 - **Inputs:** raw question, the first annotated nonempty topic entity (gold entity linking), current entity, traversed path, and legal actions. Answer lists, inferential chains, SPARQL, constraints, and answer names from supervision never enter observations. The selected topic is independent of answers and graph coverage.
-- **Actions:** every outgoing `(relation, destination)` pair, inverse edges by default, plus NO_OP. Duplicate triples are removed; ordering is deterministic. NO_OP stays in place and consumes a step. Each mediator/CVT edge counts as one raw hop; a two-relation semantic question can need more than two raw hops. `--no-inverse-edges` is an explicit alternative protocol.
+- **Actions:** the legal pool contains every outgoing `(relation, destination)` pair, inverse edges by default, plus NO_OP. Duplicate triples are removed; the full pool has deterministic order. Candidate sampling selects the list actually presented to Kev. NO_OP stays in place and consumes a step. Each mediator/CVT edge counts as one raw hop; a two-relation semantic question can need more than two raw hops. `--no-inverse-edges` is an explicit alternative protocol.
 - **Search:** fixed-horizon beam search with cumulative log probabilities. Beam width 1 is greedy. The reported answer set is the unique endpoints of the retained paths; top-1 is the endpoint of the highest-probability path. Duplicate endpoints may occupy beam slots. Endpoints are not filtered or reranked using gold answers, answer types, or a learned answer model.
 - **Metrics:** best-parse macro precision, recall and F1 use Microsoft's original answers. `hits_at_1` and `hits_at_k` are endpoint membership against the union of annotated answers; they are additional retrieval metrics, not answer-set F1. Multiple valid parses are scored separately for F1, rather than unioning their denominators.
 - **Coverage:** reports include missing graphs/starts, hop-limited reachable-answer coverage, and name coverage over entity occurrences. These diagnostics may use gold answers only after policy execution; the policy cannot read them. Graph reachability is an upper bound before context limits, not a model score. Test questions missing an NSM graph remain in the denominator with empty predictions.
-- **Context:** all actions must fit one strict row. The internal encoder supports variable action counts; this offline runner does not use the HTTP API's 255-choice schema. No candidate pruning or truncation occurs. A context overflow terminates that rollout with reward 0; during beam search the affected path fails. Reports count affected questions, and training logs failed trajectories. If a start state overflows, it yields no gradient. Check these counts on development before committing to a full training run. Change the row limit/horizon on development if needed, then rerun both arms with identical settings. Longer inputs can be expensive and are outside the released model's original short-context training regime.
+- **Context:** the offered candidates must fit one strict row. The internal encoder supports variable action counts; this offline runner does not use the HTTP API's 255-choice schema. Sampling happens before the model call, and whole options are removed only under the explicit sampler above. An unresolvable context overflow terminates that rollout with reward 0; during beam search the affected path fails. Reports count affected questions, and training logs failed trajectories. If a start state overflows, it yields no gradient. Check these counts on development before committing to a full training run. Longer inputs can be expensive and are outside the released model's original short-context training regime.
 - **Scope:** pre-extracted NSM graphs impose a retrieval ceiling. This is gold-topic, subgraph-constrained traversal, so results are not directly comparable to live whole-Freebase traversal or full constraint-aware semantic parsing. Multi-answer questions are limited by the number and diversity of retained endpoints. Nothing here claims an accuracy improvement before you run the comparison.
 
 `provenance.json` records arguments, data hashes, code hashes and initial weights. Evaluation reports fingerprint the weights actually evaluated, including saved RL checkpoints. Keep these artifacts alongside results.
 
 ## Optional verification
 
-The focused checks cover split isolation, missing-graph denominators, label separation, mediator/inverse/NO_OP traversal, best-parse metrics, overflow handling, and a small analytical policy-gradient update. They require no model weights:
+The focused checks cover split isolation, missing-graph denominators, label separation, mediator/inverse/NO_OP traversal, best-parse metrics, seeded candidate sampling, strict token budgeting, training/evaluation candidate consistency, overflow handling, and a small analytical policy-gradient update. They require no model weights:
 
 ```bash
 .venv/bin/python -m pytest tests/test_webqsp.py tests/test_conventions.py -q

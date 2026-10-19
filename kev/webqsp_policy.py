@@ -1,5 +1,6 @@
 """One graph policy shared by frozen evaluation and on-policy REINFORCE."""
 import math
+import random
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 
@@ -9,6 +10,64 @@ from .checkpoint import Checkpoint, LoadOptions, write_meta
 from .model import ContextOverflow
 from .suite import digest
 from .webqsp_data import Action, observation
+
+
+class CandidateSampler:
+    """Sample edges before encoding; keep a random prefix that fits the actual row budget."""
+    def __init__(self, candidate_edges=128, seed=42):
+        if candidate_edges < 0:
+            raise ValueError("candidate_edges must be nonnegative")
+        self.candidate_edges, self.seed = candidate_edges, seed
+        self.rng = random.Random(seed)
+        self.totals = dict.fromkeys(("prepared_decisions", "legal_actions", "offered_actions", "capped_decisions",
+                                   "token_limited_decisions", "noop_only_decisions", "encoded_tokens"), 0)
+
+    def provenance(self):
+        return {"method": "uniform_sample_then_fitting_prefix" if self.candidate_edges else "all_actions",
+                "candidate_edges": self.candidate_edges, "no_op_always_available": True, "seed": self.seed}
+
+    def counts(self, previous=None):
+        return {key: value - (previous or {}).get(key, 0) for key, value in self.totals.items()}
+
+    def select(self, actions, encode):
+        """`actions[0]` is NO_OP; `encode` applies the normal strict Kev encoder to a whole list."""
+        edges = list(actions[1:])
+        capped = bool(self.candidate_edges and len(edges) > self.candidate_edges)
+        if capped:
+            edges = self.rng.sample(edges, self.candidate_edges)
+        selected = (actions[0], *edges)
+        encoded, token_limited = None, False
+        if len(selected) > 1:
+            try:
+                encoded = encode(selected)
+            except ContextOverflow as error:
+                if not self.candidate_edges or error.state_tokens is not None:
+                    raise
+                # Every tested prefix keeps whole options and their indices. Its
+                # token length grows monotonically, so binary search is exact.
+                # Shuffle only now if the degree cap did not already sample an order.
+                if not capped:
+                    self.rng.shuffle(edges)
+                encoded = encode((actions[0],))  # Propagate an overlong state/instruction.
+                lo, hi = 0, len(edges)
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    try:
+                        trial = encode((actions[0], *edges[:mid]))
+                    except ContextOverflow:
+                        hi = mid - 1
+                    else:
+                        lo, encoded = mid, trial
+                selected = (actions[0], *edges[:lo])
+                token_limited = len(selected) < len(edges) + 1
+        self.totals["prepared_decisions"] += 1
+        self.totals["legal_actions"] += len(actions)
+        self.totals["offered_actions"] += len(selected)
+        self.totals["capped_decisions"] += int(capped)
+        self.totals["token_limited_decisions"] += int(token_limited)
+        self.totals["noop_only_decisions"] += int(len(selected) == 1)
+        self.totals["encoded_tokens"] += len(encoded["ids"]) if encoded is not None else 0
+        return selected, encoded if len(selected) > 1 else None
 
 
 class Policy:
@@ -112,25 +171,28 @@ def initial_trajectory(query, graph):
     return Trajectory(query.start)
 
 
-def decision(policy, query, graph, names, trajectory, hops):
+def decision(policy, query, graph, names, trajectory, hops, sampler=None):
     actions = graph.actions(trajectory.endpoint)
-    if len(actions) == 1:
-        return actions, None, None  # A forced NO_OP has log probability and entropy zero.
-    record = observation(query, trajectory.endpoint, trajectory.path, actions, names, hops)
-    encoded = policy.encode(record)
-    return actions, encoded, policy.distribution(encoded)
+    def encode(candidates):
+        return policy.encode(observation(query, trajectory.endpoint, trajectory.path, candidates, names, hops))
+    if sampler is not None:
+        actions, encoded = sampler.select(actions, encode)
+    else:
+        encoded = encode(actions) if len(actions) > 1 else None
+    # A forced NO_OP has log probability and entropy zero.
+    return actions, encoded, policy.distribution(encoded) if encoded is not None else None
 
 
 @torch.no_grad()
-def rollout(policy, query, graph, names, hops):
+def rollout(policy, query, graph, names, hops, sampler=None):
     trajectory = initial_trajectory(query, graph)
     if trajectory.failure:
         return trajectory
     for _ in range(hops):
         try:
-            actions, encoded, distribution = decision(policy, query, graph, names, trajectory, hops)
+            actions, encoded, distribution = decision(policy, query, graph, names, trajectory, hops, sampler)
         except ContextOverflow as error:
-            # No silent truncation or gold-based action pruning. Failure is an
+            # No state/option text truncation or gold-based pruning. Failure is an
             # absorbing terminal state, with reward zero even at a gold node.
             return replace(trajectory, endpoint=None, failure=f"context_overflow: {error}")
         index = int(distribution.sample().item()) if distribution is not None else 0
@@ -142,7 +204,7 @@ def rollout(policy, query, graph, names, hops):
 
 
 @torch.no_grad()
-def beam_search(policy, query, graph, names, hops, width):
+def beam_search(policy, query, graph, names, hops, width, sampler=None):
     """Top paths by summed log probability; no answer-based reranking or merging."""
     first = initial_trajectory(query, graph)
     if first.failure:
@@ -152,12 +214,12 @@ def beam_search(policy, query, graph, names, hops, width):
         expanded = []
         for trajectory in beams:
             try:
-                actions, _, distribution = decision(policy, query, graph, names, trajectory, hops)
+                actions, _, distribution = decision(policy, query, graph, names, trajectory, hops, sampler)
             except ContextOverflow as error:
                 failures.append(f"context_overflow: {error}")
                 continue
             logps = distribution.logits.cpu().tolist() if distribution is not None else [0.0]
-            # Stable ties follow the deterministic action order, including NO_OP.
+            # Stable ties follow the offered action order, including NO_OP.
             indices = sorted(range(len(actions)), key=lambda i: -logps[i])[:width]
             for i in indices:
                 expanded.append(Trajectory(actions[i].target, (*trajectory.path, actions[i]),

@@ -23,22 +23,24 @@ from .model import SERVE_MAX_BRANCH_8K, SERVE_MAX_BRANCH
 from .predictors import kernel_environment
 from .suite import digest, write_json, write_jsonl
 from .webqsp_data import Dataset, graph_diagnostics, score
-from .webqsp_policy import Policy, beam_search, reinforce, rollout
+from .webqsp_policy import CandidateSampler, Policy, beam_search, reinforce, rollout
 
 
-def evaluate(policy, dataset, hops, beam_width, out):
+def evaluate(policy, dataset, hops, beam_width, out, candidate_edges=128, seed=42):
     """Keep every eligible question in the denominator, even without a graph/path."""
     out.mkdir(parents=True, exist_ok=False)
     rows, predictions = [], []
+    sampler = CandidateSampler(candidate_edges, seed)
     for index, example in enumerate(dataset.examples):
         graph = dataset.graph(example)
-        paths, failures = beam_search(policy, example.query, graph, dataset.names, hops, beam_width)
+        before = sampler.counts()
+        paths, failures = beam_search(policy, example.query, graph, dataset.names, hops, beam_width, sampler)
         endpoints = list(dict.fromkeys(path.endpoint for path in paths))
         gold = example.answers
         rows.append({"id": example.query.id, **score(example, endpoints),
                      "hits_at_1": float(bool(endpoints) and endpoints[0] in gold),
                      "hits_at_k": float(bool(set(endpoints) & gold)),
-                     "predicted": endpoints, "failures": failures,
+                     "predicted": endpoints, "failures": failures, "sampling": sampler.counts(before),
                      "paths": [{"endpoint": p.endpoint, "log_probability": p.log_probability,
                                 "moves": [asdict(a) for a in p.path]} for p in paths],
                      **graph_diagnostics(example, graph, dataset.names, hops)})
@@ -57,7 +59,8 @@ def evaluate(policy, dataset, hops, beam_width, out):
               "entity_occurrences": sum(r["entity_ids"] for r in rows),
               "named_entity_occurrences": sum(r["named_entity_ids"] for r in rows),
               "hops": hops, "beam_width": beam_width, "inverse_edges": dataset.inverse,
-              "row_tokens": policy.row_tokens, "policy": policy.provenance(), "dataset": dataset.provenance,
+              "row_tokens": policy.row_tokens, "candidate_sampling": sampler.provenance(), "sampling": sampler.counts(),
+              "policy": policy.provenance(), "dataset": dataset.provenance,
               "environment": kernel_environment(policy.model, policy.device)}
     write_jsonl(out / "rows.jsonl", rows)
     write_json(out / "predictions.json", predictions)  # Microsoft's eval.py input format.
@@ -68,6 +71,7 @@ def evaluate(policy, dataset, hops, beam_width, out):
 def train(policy, dataset, development, args, out, provenance):
     optimizer = torch.optim.AdamW(policy.model.trainable_parameters(), lr=args.lr, weight_decay=0.0)
     rng = random.Random(args.seed)
+    sampler = CandidateSampler(args.candidate_edges, args.seed)
     baseline, updates, best_f1, best_checkpoint = 0.0, 0, -1.0, None
     with (out / "train.jsonl").open("w", encoding="utf-8", newline="\n") as log:
         for epoch in range(1, args.epochs + 1):
@@ -75,11 +79,13 @@ def train(policy, dataset, development, args, out, provenance):
             rng.shuffle(examples)
             for example in examples:
                 graph = dataset.graph(example)
-                trajectories = [rollout(policy, example.query, graph, dataset.names, args.hops)
+                before = sampler.counts()
+                trajectories = [rollout(policy, example.query, graph, dataset.names, args.hops, sampler)
                                 for _ in range(args.rollouts)]
                 stats = reinforce(policy, trajectories, example.answers, optimizer, baseline, args.entropy)
                 updates += int(stats["optimizer_step"])
                 row = {"epoch": epoch, "id": example.query.id, "update": updates, "baseline": baseline, **stats,
+                       "sampling": sampler.counts(before),
                        "failures": [t.failure for t in trajectories if t.failure]}
                 # Baseline uses only PREVIOUS questions at the point a gradient is
                 # computed. Including this group's rewards would bias the estimate.
@@ -96,7 +102,8 @@ def train(policy, dataset, development, args, out, provenance):
             policy.save(checkpoint, {**provenance, "epoch": epoch, "updates": updates,
                                      "baseline": baseline, "objective": "terminal-membership REINFORCE"})
             policy.model.eval()
-            report = evaluate(policy, development, args.hops, args.beam_width, out / f"epoch-{epoch}" / "dev")
+            report = evaluate(policy, development, args.hops, args.beam_width, out / f"epoch-{epoch}" / "dev",
+                              args.candidate_edges, args.seed)
             policy.model.train()
             if report["f1"] > best_f1:
                 best_f1, best_checkpoint = report["f1"], checkpoint
@@ -125,6 +132,8 @@ def parse_args():
         command.add_argument("--beam-width", type=int, default=8, help="evaluation beam size; 1 is greedy")
         command.add_argument("--inverse-edges", action=argparse.BooleanOptionalAction, default=True)
         command.add_argument("--row-tokens", type=int, default=SERVE_MAX_BRANCH_8K, help="strict state+options token limit")
+        command.add_argument("--candidate-edges", type=int, default=128,
+                             help="sample at most this many edges, plus NO_OP, then fit the row budget; 0: all actions, no pruning")
         command.add_argument("--temperature", type=float, help="fixed policy temperature; default: checkpoint value")
         command.add_argument("--seed", type=int, default=42)
         if name == "evaluate":
@@ -140,6 +149,8 @@ def parse_args():
     args = parser.parse_args()
     if args.hops < 1 or args.beam_width < 1 or not 1 <= args.row_tokens <= SERVE_MAX_BRANCH:
         parser.error("hops/beam-width must be positive; row-tokens must be within the Kev row context")
+    if args.candidate_edges < 0:
+        parser.error("candidate-edges must be nonnegative")
     if args.precision == "bf16" and args.device != "cuda":
         parser.error("bf16 autocast requires CUDA; use --precision fp32 on CPU")
     if args.temperature is not None and (not math.isfinite(args.temperature) or args.temperature <= 0):
@@ -169,7 +180,7 @@ def main():
                   "code_sha256": {p.name: digest(p) for p in code}}
     out = Path(args.out)
     if args.command == "evaluate":
-        report = evaluate(policy, dataset, args.hops, args.beam_width, out)
+        report = evaluate(policy, dataset, args.hops, args.beam_width, out, args.candidate_edges, args.seed)
         write_json(out / "provenance.json", provenance)
         print(json.dumps({k: report[k] for k in ("questions", "f1", "hits_at_1", "hits_at_k", "empty_predictions")}, indent=2))
     else:
