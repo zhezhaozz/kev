@@ -75,7 +75,8 @@ def kernel_environment(model, device):
         try: return version(name)
         except PackageNotFoundError: return None
     packages = {name: installed(name) for name in KERNEL_PACKAGES}
-    packages["torch"] = torch.__version__   # with its build tag (2.8.0+cu128 on the CUDA wheels), which the metadata version drops
+    # Keep version metadata weights-only-loadable when embedded in head.pt.
+    packages["torch"] = str(torch.__version__)   # with its build tag (2.8.0+cu128 on the CUDA wheels), which the metadata version drops
     env = {"packages": packages, "device": str(device),
            "gpu": torch.cuda.get_device_name(torch.device(device)) if str(device).startswith("cuda") else None,
            "backend": model.backend, "dtype": model.dtype, "triton_f32_default": os.environ.get("TRITON_F32_DEFAULT"),
