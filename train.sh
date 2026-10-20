@@ -11,4 +11,4 @@ WEBQSP_ARGS=(
   --questions "$WEBQSP_DATA/WebQSP/data/WebQSP.train.json" \
   "${WEBQSP_ARGS[@]}" \
   --epochs 3 --rollouts 4 --lr 5e-6 --entropy 0.01 --baseline-decay 0.9 \
-  --out "$WEBQSP_DATA/runs/webqsp-rl"
+  --out "$WEBQSP_DATA/runs/webqsp-rl-v2"
