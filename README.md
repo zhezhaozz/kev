@@ -211,6 +211,8 @@ uv run --extra serve python -m kev.serve --run runs/mine --port 8009
 
 `--batch 1 --accum 8` in bf16 fits the 0.8B model on a 4 GB GPU. The benchmark reports accuracy, Brier score and calibration per question type, so you can see which of your questions the fine-tune helped. The checkpoint you started from is recorded in `runs/mine/training_config.json`. On a Mac, run one training job at a time; two jobs on the same Apple GPU are much slower.
 
+For knowledge-graph experiments, [WebQSP traversal](docs/webqsp.md) provides frozen Kev-4B evaluation and terminal-reward REINFORCE on NSM subgraphs, with commands for one A100 80GB.
+
 ## Deploy Your Own Endpoint
 
 To get an HTTPS endpoint instead of a local server, you don't need this repo, just a [Modal](https://modal.com) account:
