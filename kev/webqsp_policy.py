@@ -1,4 +1,4 @@
-"""One graph policy shared by frozen evaluation and on-policy REINFORCE."""
+"""One graph policy shared by frozen evaluation, REINFORCE and GRPO."""
 import math
 import random
 from contextlib import nullcontext
@@ -211,6 +211,9 @@ class Decision:
     action_index: int
     baseline: float | None = None
     value_features: torch.Tensor | None = None
+    old_log_probability: float | None = None
+    excluded: tuple[int, ...] = ()
+    stage: str = "move"
 
 
 @dataclass
@@ -230,7 +233,9 @@ def initial_trajectory(query, graph):
     return Trajectory(query.start)
 
 
-def decision(policy, query, graph, names, trajectory, hops, sampler=None, with_value=False):
+def decision(policy, query, graph, names, trajectory, hops, sampler=None, with_value=False, decisions=None):
+    # `decisions` is the rollout's accumulator. Windowed preparation records its
+    # internal nominations there before the common traversal loop samples a move.
     actions = graph.actions(trajectory.endpoint)
     def encode(candidates):
         return policy.encode(observation(query, trajectory.endpoint, trajectory.path, candidates, names, hops))
@@ -248,29 +253,35 @@ def decision(policy, query, graph, names, trajectory, hops, sampler=None, with_v
 
 
 @torch.no_grad()
-def rollout(policy, query, graph, names, hops, sampler=None, with_value=False):
+def rollout(policy, query, graph, names, hops, sampler=None, with_value=False, prepare=decision):
     trajectory = initial_trajectory(query, graph)
     if trajectory.failure:
         return trajectory
     for _ in range(hops):
+        decisions = list(trajectory.decisions)
         try:
-            actions, encoded, distribution, baseline, features = decision(
-                policy, query, graph, names, trajectory, hops, sampler, with_value)
+            actions, encoded, distribution, baseline, features = prepare(
+                policy, query, graph, names, trajectory, hops, sampler, with_value, decisions)
         except ContextOverflow as error:
             # No state/option text truncation or gold-based pruning. Failure is an
             # absorbing terminal state, with reward zero even at a gold node.
-            return replace(trajectory, endpoint=None, failure=f"context_overflow: {error}")
+            nomination_logp = sum(step.old_log_probability for step in decisions[len(trajectory.decisions):])
+            return replace(trajectory, endpoint=None, decisions=tuple(decisions),
+                           log_probability=trajectory.log_probability + nomination_logp,
+                           failure=f"context_overflow: {error}")
         index = int(distribution.sample().item()) if distribution is not None else 0
         chosen = actions[index]
         logp = float(distribution.logits[index].item()) if distribution is not None else 0.0
-        decisions = (trajectory.decisions + (Decision(encoded, index, baseline, features),)
-                     if encoded is not None else trajectory.decisions)
-        trajectory = Trajectory(chosen.target, (*trajectory.path, chosen), trajectory.log_probability + logp, decisions)
+        nomination_logp = sum(step.old_log_probability for step in decisions[len(trajectory.decisions):])
+        if encoded is not None:
+            decisions.append(Decision(encoded, index, baseline, features, old_log_probability=logp))
+        trajectory = Trajectory(chosen.target, (*trajectory.path, chosen),
+                                trajectory.log_probability + nomination_logp + logp, tuple(decisions))
     return trajectory
 
 
 @torch.no_grad()
-def beam_search(policy, query, graph, names, hops, width, sampler=None):
+def beam_search(policy, query, graph, names, hops, width, sampler=None, prepare=decision):
     """Top paths by summed log probability; no answer-based reranking or merging."""
     first = initial_trajectory(query, graph)
     if first.failure:
@@ -280,7 +291,7 @@ def beam_search(policy, query, graph, names, hops, width, sampler=None):
         expanded = []
         for trajectory in beams:
             try:
-                actions, _, distribution, _, _ = decision(policy, query, graph, names, trajectory, hops, sampler)
+                actions, _, distribution, _, _ = prepare(policy, query, graph, names, trajectory, hops, sampler)
             except ContextOverflow as error:
                 failures.append(f"context_overflow: {error}")
                 continue

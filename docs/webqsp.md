@@ -1,12 +1,14 @@
 # WebQSP graph traversal with Kev
 
-`kev.webqsp` runs the released Qwen3.5 Kev policy on pre-extracted question graphs and optionally adapts its LoRA adapter and pointer head with REINFORCE. Evaluation alone does not train or change the checkpoint. The default checkpoint is `jaredpalmer/kev-4b@v1.0`.
+`kev.webqsp` runs the released Qwen3.5 Kev policy on pre-extracted question graphs and optionally adapts its LoRA adapter and pointer head with REINFORCE or GRPO. Evaluation alone does not train or change the checkpoint. The default checkpoint is `jaredpalmer/kev-4b@v1.0`.
 
 This is a MINERVA-style terminal-reward traversal experiment, not a reproduction of MINERVA's embedding/LSTM architecture. Kev scores outgoing graph moves from the question and path text. Outputs are endpoint IDs; there is no answer-generating LLM or executable SPARQL stage.
 
-The implementation has been source-reviewed but **has not been executed, benchmarked, or trained**. The commands below are for you to run. A100 memory use, runtime, and QA accuracy have not been measured.
+The implementation has CPU unit and toy-actor integration checks. **No WebQSP training or released-checkpoint GPU run has been performed for this change.** A100 memory use, runtime, and QA accuracy have not been measured.
 
 This branch implements **version 2: sampled candidate sets with a direct value head V(s, C)**, built on version 1's identical sampler. Training defaults to `--baseline value`; `--baseline ema` selects version 1's moving-average reward baseline. The default offers at most 128 graph edges plus `NO_OP`, within the configured token budget. `--candidate-edges 0` restores the original all-actions, strict-overflow protocol. Compare frozen and trained checkpoints with the same candidate settings.
+
+The opt-in [windowed GRPO experiment](webqsp-grpo.md) uses `--algorithm grpo`: exhaustive windows of at most 128 edges, two nominations per window, and four complete trajectories per question. Both selection steps share the actor and instruction. The REINFORCE command below retains its existing defaults.
 
 ## Data
 
@@ -184,9 +186,9 @@ Training and beam evaluation call the same candidate constructor. Each training 
 The focused checks cover split isolation, missing-graph denominators, label separation, mediator/inverse/NO_OP traversal, best-parse metrics, seeded candidate sampling, strict token budgeting, training/evaluation candidate consistency, overflow handling, analytical actor updates, value-gradient isolation, saved baselines, feature readout in packed/causal/shared-prefix forms, and value-head checkpoint round trips. They require no model weights:
 
 ```bash
-.venv/bin/python -m pytest tests/test_webqsp.py tests/test_conventions.py -q
+.venv/bin/python -m pytest tests/test_webqsp.py tests/test_webqsp_grpo.py tests/test_conventions.py -q
 ```
 
-No tests or model runs were executed while preparing this change.
+The GRPO checks additionally cover exhaustive windows, conditional probabilities without replacement, gradients through both stages, clipping, zero-variance groups, and training/evaluation metadata. These suites also run in CI.
 
 References: [MINERVA](https://arxiv.org/abs/1711.05851), [NSM preprocessing](https://github.com/RichardHGL/WSDM2021_NSM/tree/main/preprocessing/Freebase), [WebQSP format and scoring](https://ad-research.cs.uni-freiburg.de/benchmarks/webqsp/doc/WebQSP.pdf), and [GNN-RAG](https://github.com/cmavro/GNN-RAG).
